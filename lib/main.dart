@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -20,28 +19,31 @@ class _RFIDPageState extends State<RFIDPage> with WidgetsBindingObserver {
   static const methodCh = MethodChannel('mifare_classic/method');
   static const eventCh = EventChannel('mifare_classic/events');
 
-  StreamSubscription? _sub;
-  String uid = '';
-  String hexData = '';
-  String textData = '';
-  String status = '';
-  bool isWriting = false;
-  bool isReading = true;
-  bool showWritePrompt = false;
-  bool showSuccessDialog = false;
-  String pendingWriteData = '';
-  bool pendingWriteIsHex = false;
-  bool fillHexWithZeros = false;
-  bool addTailDots = true; // NEW: Always add tail dots for text
-  TextEditingController _writeText = TextEditingController();
-  TextEditingController _writeHex = TextEditingController();
+  StreamSubscription? _nfcSubscription;
+  String _uid = '';
+  String _hexData = '';
+  String _textData = '';
+  String _status = 'Ready - tap RFID card';
+  bool _isWriting = false;
   bool _isAppActive = true;
+  TextEditingController _writeTextController = TextEditingController();
+  TextEditingController _writeHexController = TextEditingController();
+  bool _fillHexWithZeros = false;
+
+  // For showing writing notification
+  OverlayEntry? _writingNotificationOverlay;
+  String _writingProgress = '';
+
+  // Performance optimizations
+  DateTime? _lastTagEventTime;
+  static const Duration _debounceDelay = Duration(milliseconds: 1000);
+  bool _isProcessingEvent = false;
+  final Duration _nfcReinitDelay = Duration(milliseconds: 1000);
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    print('App initialized');
     _initializeNFC();
   }
 
@@ -52,611 +54,444 @@ class _RFIDPageState extends State<RFIDPage> with WidgetsBindingObserver {
     switch (state) {
       case AppLifecycleState.resumed:
         _isAppActive = true;
-        print('App resumed - reinitializing NFC');
-        _reinitializeNFC();
+        Future.delayed(_nfcReinitDelay, () {
+          if (_isAppActive && !_isWriting) {
+            _initializeNFC();
+          }
+        });
         break;
       case AppLifecycleState.inactive:
-        _isAppActive = false;
-        print('App inactive');
-        break;
       case AppLifecycleState.paused:
         _isAppActive = false;
-        print('App paused');
+        _stopNFC();
         break;
-      case AppLifecycleState.detached:
-        _isAppActive = false;
-        print('App detached');
-        break;
-      case AppLifecycleState.hidden:
-        _isAppActive = false;
-        print('App hidden');
+      default:
         break;
     }
   }
 
-  void _initializeNFC() async {
-    print('Initializing NFC...');
+  Future<void> _initializeNFC() async {
+    if (_isWriting || !_isAppActive) return;
 
     try {
-      await _sub?.cancel();
-      _sub = null;
+      await _stopNFC();
 
-      _sub = eventCh.receiveBroadcastStream().listen(
-        _onTagEvent,
-        onError: (e) {
-          print('Event channel error: $e');
-          setState(() => status = "Event error: $e");
-        },
+      _nfcSubscription = eventCh.receiveBroadcastStream().listen(
+        _handleTagEvent,
+        onError: (e) => print('NFC event error: $e'),
         cancelOnError: true,
       );
 
-      print('NFC listener initialized');
-      await _startScan();
+      await methodCh.invokeMethod('startScan');
+      _updateStatus('Ready - tap RFID card');
     } catch (e) {
-      print('Error initializing NFC: $e');
-      setState(() => status = 'Initialization error: $e');
+      _updateStatus('NFC init error: $e');
     }
   }
 
-  void _reinitializeNFC() {
-    print('Reinitializing NFC...');
-
-    Future.delayed(Duration(milliseconds: 500), () {
-      if (_isAppActive) {
-        _initializeNFC();
-      }
-    });
+  Future<void> _stopNFC() async {
+    try {
+      await _nfcSubscription?.cancel();
+      _nfcSubscription = null;
+      await methodCh.invokeMethod('stopScan');
+    } catch (e) {
+      print('Error stopping NFC: $e');
+    }
   }
 
-  void _onTagEvent(dynamic event) {
-    print('Received event: $event');
+  Future<void> _handleTagEvent(dynamic event) async {
+    if (!_isAppActive || _isWriting) return;
 
-    if (!_isAppActive) {
-      print('App not active, ignoring event');
+    final now = DateTime.now();
+    if (_lastTagEventTime != null &&
+        now.difference(_lastTagEventTime!) < _debounceDelay) {
       return;
     }
+    _lastTagEventTime = now;
 
-    setState(() {
+    if (_isProcessingEvent) return;
+    _isProcessingEvent = true;
+
+    try {
       if (event is Map) {
         final eventMap = Map<String, dynamic>.from(event);
 
-        uid = eventMap['uid']?.toString() ?? eventMap['fullUid']?.toString() ?? '';
-
         if (eventMap.containsKey('error')) {
-          status = eventMap['error']?.toString() ?? 'Unknown error';
-          hexData = '';
-          textData = '';
-          isWriting = false;
-          showWritePrompt = false;
-        } else {
-          if (isWriting && pendingWriteData.isNotEmpty) {
-            _executeWrite();
-          } else {
-            status = 'Tag detected';
-
-            final rawBlocks = eventMap['blocks'] as List<dynamic>? ?? [];
-            final blocks = _safeConvertBlocks(rawBlocks);
-
-            textData = _extractAllText(blocks);
-            hexData = _extractAllHex(blocks);
-
-            print('Extracted ${textData.length} chars of text, ${hexData.length} chars of hex');
-          }
+          _updateStatus('Error: ${eventMap['error']}');
+          return;
         }
-      } else {
-        status = 'Unknown event';
-        hexData = '';
-        textData = '';
-        isWriting = false;
-        showWritePrompt = false;
+
+        final uid = eventMap['uid']?.toString() ?? '';
+        final blocks = eventMap['blocks'] as List<dynamic>? ?? [];
+
+        await _processTagData(uid, blocks);
       }
-    });
+    } catch (e) {
+      _updateStatus('Error processing tag: $e');
+    } finally {
+      _isProcessingEvent = false;
+    }
   }
 
-  List<Map<String, dynamic>> _safeConvertBlocks(List<dynamic> rawBlocks) {
-    final List<Map<String, dynamic>> converted = [];
+  Future<void> _processTagData(String uid, List<dynamic> rawBlocks) async {
+    if (uid.isNotEmpty && uid != _uid) {
+      setState(() => _uid = uid);
+    }
 
-    for (var block in rawBlocks) {
+    _updateStatus('Tag detected');
+
+    final processed = await _extractTagData(rawBlocks);
+
+    if (mounted) {
+      setState(() {
+        _textData = processed['text'] ?? '(No text)';
+        _hexData = processed['hex'] ?? '(No hex)';
+      });
+    }
+  }
+
+  Future<Map<String, String>> _extractTagData(List<dynamic> rawBlocks) async {
+    final textBuffer = StringBuffer();
+    final hexBuffer = StringBuffer();
+
+    final blocksToProcess = rawBlocks.length > 20
+        ? rawBlocks.sublist(0, 20)
+        : rawBlocks;
+
+    for (var block in blocksToProcess) {
       if (block is Map) {
-        try {
-          final safeBlock = Map<String, dynamic>.from(block);
-          converted.add(safeBlock);
-        } catch (e) {
-          print('Error converting block: $e');
-        }
-      }
-    }
+        final blockMap = Map<String, dynamic>.from(block);
 
-    return converted;
-  }
+        final text = blockMap['text']?.toString() ?? '';
+        final hex = blockMap['hex']?.toString() ?? '';
+        final sector = blockMap['sector'] ?? 0;
+        final blockNum = blockMap['block'] ?? 0;
 
-  String _extractAllText(List<Map<String, dynamic>> blocks) {
-    if (blocks.isEmpty) return '(No data)';
+        if (sector > 0 && blockNum < 3 && hex.isNotEmpty && hex != 'AUTH ERROR') {
+          hexBuffer.write(hex);
 
-    String allText = '';
-
-    for (var block in blocks) {
-      final text = block['text']?.toString() ?? '';
-      final sector = block['sector'] ?? 0;
-      final blockNum = block['block'] ?? 0;
-
-      if (sector > 0 && blockNum < 3) {
-        final cleanText = text.replaceAll(RegExp(r'[^\x20-\x7E]'), '');
-        if (cleanText.isNotEmpty) {
-          allText += cleanText;
-        }
-      }
-    }
-
-    if (allText.isEmpty) {
-      for (var block in blocks) {
-        final text = block['text']?.toString() ?? '';
-        final cleanText = text.replaceAll(RegExp(r'[^\x20-\x7E]'), '');
-        if (cleanText.isNotEmpty) {
-          allText += cleanText;
-        }
-      }
-    }
-
-    return allText.isNotEmpty ? allText : '(No printable text found)';
-  }
-
-  String _extractAllHex(List<Map<String, dynamic>> blocks) {
-    if (blocks.isEmpty) return '(No data)';
-
-    String allHex = '';
-
-    for (var block in blocks) {
-      final hex = block['hex']?.toString() ?? '';
-      final sector = block['sector'] ?? 0;
-      final blockNum = block['block'] ?? 0;
-
-      if (sector > 0 && blockNum < 3) {
-        if (hex.isNotEmpty && hex != 'AUTH ERROR' && hex != 'READ ERROR') {
-          allHex += hex;
-        }
-      }
-    }
-
-    if (allHex.isEmpty) {
-      for (var block in blocks) {
-        final hex = block['hex']?.toString() ?? '';
-        if (hex.isNotEmpty && hex != 'AUTH ERROR' && hex != 'READ ERROR') {
-          allHex += hex;
-        }
-      }
-    }
-
-    return allHex.isNotEmpty ? allHex : '(No hex data found)';
-  }
-
-  Future _startScan() async {
-    try {
-      print('Starting scan...');
-      await methodCh.invokeMethod('startScan');
-      setState(() {
-        status = 'Ready - tap tag';
-        isReading = true;
-        isWriting = false;
-      });
-      print('Scan started successfully');
-    } catch (e) {
-      print('startScan error: $e');
-      setState(() => status = 'startScan error: $e');
-    }
-  }
-
-  Future<void> _executeWrite() async {
-    try {
-      print('Executing write: isHex=$pendingWriteIsHex');
-      print('Data length: ${pendingWriteData.length}');
-      print('Fill hex with zeros: $fillHexWithZeros');
-
-      final result = await methodCh.invokeMethod('writeData', {
-        'data': pendingWriteData,
-        'isHex': pendingWriteIsHex,
-      });
-
-      if (result == true) {
-        if (showWritePrompt) {
-          Navigator.of(context).pop();
-        }
-
-        _showSuccessDialog();
-
-        setState(() {
-          status = 'Write successful!';
-          isWriting = false;
-          showWritePrompt = false;
-          pendingWriteData = '';
-          fillHexWithZeros = false; // Reset flag
-        });
-
-        _writeText.clear();
-        _writeHex.clear();
-
-        Future.delayed(Duration(seconds: 2), () {
-          if (mounted && _isAppActive) {
-            setState(() {
-              isReading = true;
-            });
+          if (text.isNotEmpty) {
+            final cleanText = text.replaceAll(RegExp(r'[^\x20-\x7E]'), '');
+            if (cleanText.isNotEmpty) {
+              textBuffer.write(cleanText);
+            }
           }
-        });
-      } else {
-        if (showWritePrompt) {
-          Navigator.of(context).pop();
-        }
-
-        setState(() {
-          status = 'Write failed - try again';
-          isWriting = false;
-          showWritePrompt = false;
-          pendingWriteData = '';
-          fillHexWithZeros = false; // Reset flag
-        });
-
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Write failed. Please try again.'),
-            backgroundColor: Colors.red,
-            duration: Duration(seconds: 3),
-          ),
-        );
-      }
-    } catch (e) {
-      if (showWritePrompt) {
-        Navigator.of(context).pop();
-      }
-
-      setState(() {
-        status = 'Write error: $e';
-        isWriting = false;
-        showWritePrompt = false;
-        pendingWriteData = '';
-        fillHexWithZeros = false; // Reset flag
-      });
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Write error: $e'),
-          backgroundColor: Colors.red,
-          duration: Duration(seconds: 3),
-        ),
-      );
-    }
-  }
-
-  void _showSuccessDialog() {
-    String message = 'Data has been written successfully!';
-    if (pendingWriteIsHex && fillHexWithZeros && _writeHex.text.isEmpty) {
-      message = 'Card filled with zeros (0x00) successfully!';
-    } else if (!pendingWriteIsHex) {
-      message = 'Text with tail dots written successfully!';
-    } else if (pendingWriteIsHex && _writeHex.text.isNotEmpty) {
-      message = 'Hex with tail zeros written successfully!';
-    }
-
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (BuildContext context) {
-        return AlertDialog(
-          title: Row(
-            children: [
-              Icon(Icons.check_circle, color: Colors.green),
-              SizedBox(width: 10),
-              Text('Success'),
-            ],
-          ),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Icon(
-                Icons.check_circle_outline,
-                size: 60,
-                color: Colors.green,
-              ),
-              SizedBox(height: 20),
-              Text(
-                message,
-                textAlign: TextAlign.center,
-                style: TextStyle(fontSize: 16),
-              ),
-              if (!pendingWriteIsHex)
-                SizedBox(height: 10),
-              if (!pendingWriteIsHex)
-                Text(
-                  'Added ${768 - _writeText.text.length} tail dots',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(fontSize: 14, color: Colors.grey),
-                ),
-              if (pendingWriteIsHex && _writeHex.text.isNotEmpty)
-                SizedBox(height: 10),
-              if (pendingWriteIsHex && _writeHex.text.isNotEmpty)
-                Text(
-                  'Added ${1536 - _writeHex.text.replaceAll(RegExp(r'\s'), '').length} tail zeros',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(fontSize: 14, color: Colors.grey),
-                ),
-              if (pendingWriteIsHex && fillHexWithZeros && _writeHex.text.isEmpty)
-                Text(
-                  'All blocks filled with 0x00 (zeros)',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(fontSize: 14, color: Colors.grey),
-                ),
-            ],
-          ),
-          actions: [
-            ElevatedButton(
-              onPressed: () {
-                Navigator.of(context).pop();
-              },
-              style: ElevatedButton.styleFrom(
-                backgroundColor: Colors.green,
-              ),
-              child: Text('OK'),
-            ),
-          ],
-        );
-      },
-    );
-  }
-
-  Future _initiateWrite({required bool isHex}) async {
-    String data = '';
-
-    if (isHex) {
-      data = _writeHex.text.trim();
-
-      // If hex field is empty and fillHexWithZeros is checked, use zeros
-      if (data.isEmpty && fillHexWithZeros) {
-        // Create hex zeros for full card (768 bytes = 1536 hex chars)
-        data = '00' * 768; // 768 bytes = 1536 hex characters
-        print('Using default zeros (${data.length} hex chars = 768 bytes)');
-      }
-
-      // Clean hex (remove spaces) if not empty
-      if (data.isNotEmpty) {
-        data = data.replaceAll(RegExp(r'\s'), '').toUpperCase();
-
-        // Validate hex format
-        if (!RegExp(r'^[0-9A-F]+$').hasMatch(data)) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text('Invalid hex characters. Use only 0-9, A-F.'),
-              backgroundColor: Colors.red,
-              duration: Duration(seconds: 3),
-            ),
-          );
-          return;
-        }
-
-        if (data.length % 2 != 0) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text('Hex string must have even number of characters'),
-              backgroundColor: Colors.red,
-              duration: Duration(seconds: 3),
-            ),
-          );
-          return;
         }
       }
-
-      final maxHexChars = 1536;
-      final hexLength = data.length;
-      if (hexLength >= maxHexChars) {
-        // Truncate to max length
-        data = data.substring(0, maxHexChars);
-        print('Hex truncated to $maxHexChars chars');
-      } else {
-        // Add tail zeros to reach 1536 total
-        final zerosNeeded = maxHexChars - hexLength;
-        // Ensure zerosNeeded is even (since we add "00" pairs)
-        final evenZerosNeeded = zerosNeeded % 2 == 0 ? zerosNeeded : zerosNeeded - 1;
-        data = data + ('00' * (evenZerosNeeded ~/ 2));
-        print('Added ${evenZerosNeeded ~/ 2} pairs of zeros to make $maxHexChars total');
-      }
-
-    } else {
-      // For text writing - ALWAYS add tail dots to make 768 total
-      data = _writeText.text.trim();
-
-      if (data.isEmpty) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Please enter text to write'),
-            backgroundColor: Colors.orange,
-            duration: Duration(seconds: 2),
-          ),
-        );
-        return;
-      }
-
-      // Calculate tail dots needed
-      final textLength = data.length;
-      final maxLength = 768;
-
-      if (textLength >= maxLength) {
-        // Truncate to max length
-        data = data.substring(0, maxLength);
-        print('Text truncated to $maxLength chars');
-      } else {
-        // Add tail dots to reach 768 total
-        final dotsNeeded = maxLength - textLength;
-        data = data + ('.' * dotsNeeded);
-        print('Added $dotsNeeded tail dots to make $maxLength total');
-      }
     }
 
-    // Validate data is not empty
-    if (data.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Please enter data to write'),
-          backgroundColor: Colors.orange,
-          duration: Duration(seconds: 2),
-        ),
-      );
-      return;
-    }
-
-    pendingWriteData = data;
-
-    setState(() {
-      showWritePrompt = true;
-      isWriting = true;
-      isReading = false;
-      pendingWriteIsHex = isHex;
-      status = 'Ready to write - bring card close...';
-    });
-
-    _showWritePrompt(isHex: isHex, dataLength: data.length);
+    return {
+      'text': textBuffer.toString().isNotEmpty
+          ? textBuffer.toString()
+          : '(No printable text)',
+      'hex': hexBuffer.toString().isNotEmpty
+          ? hexBuffer.toString()
+          : '(No hex data)',
+    };
   }
 
-  void _showWritePrompt({required bool isHex, required int dataLength}) {
-    String dataType = isHex ? 'Hex' : 'Text';
-    String dataPreview = pendingWriteData.length > 50
-        ? '${pendingWriteData.substring(0, 50)}...'
-        : pendingWriteData;
+  // Show writing notification overlay
+  void _showWritingNotification({required bool isHex}) {
+    // Remove any existing notification first
+    _hideWritingNotification();
 
-    // Calculate tail dots info for text
-    // Calculate tail dots/zeros info
-    String tailInfo = '';
-    if (!isHex && _writeText.text.isNotEmpty) {
-      final textLength = _writeText.text.length;
-      final dotsAdded = dataLength - textLength;
-      if (dotsAdded > 0) {
-        tailInfo = ' + $dotsAdded tail dots';
-      }
-    } else if (isHex && _writeHex.text.isNotEmpty) {
-      final hexLength = _writeHex.text.replaceAll(RegExp(r'\s'), '').length;
-      final zerosAdded = dataLength - hexLength;
-      if (zerosAdded > 0) {
-        tailInfo = ' + $zerosAdded tail zeros';
-      }
-    }
-
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (BuildContext context) {
-        return AlertDialog(
-          title: Row(
-            children: [
-              Icon(Icons.nfc, color: Colors.orange),
-              SizedBox(width: 10),
-              Text('Ready to Write'),
-            ],
-          ),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Icon(
-                Icons.touch_app,
-                size: 60,
-                color: Colors.orange,
-              ),
-              SizedBox(height: 20),
-              Text(
-                'Bring the RFID card close to your phone',
-                textAlign: TextAlign.center,
-                style: TextStyle(fontSize: 16),
-              ),
-              SizedBox(height: 10),
-              Text(
-                'Writing will start automatically.',
-                textAlign: TextAlign.center,
-                style: TextStyle(fontSize: 14, color: Colors.grey),
-              ),
-              SizedBox(height: 15),
-              Container(
-                padding: EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  color: Colors.grey[100],
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: Colors.grey[300]!),
+    _writingNotificationOverlay = OverlayEntry(
+      builder: (context) => Positioned(
+        top: MediaQuery.of(context).padding.top + 10,
+        left: 16,
+        right: 16,
+        child: Material(
+          elevation: 8,
+          borderRadius: BorderRadius.circular(12),
+          child: Container(
+            padding: EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: Colors.orange,
+              borderRadius: BorderRadius.circular(12),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black26,
+                  blurRadius: 10,
+                  spreadRadius: 2,
                 ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
+              ],
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
                   children: [
-                    Text(
-                      'Write Details:',
-                      style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12),
-                    ),
-                    SizedBox(height: 5),
-                    Text(
-                      'Type: $dataType',
-                      style: TextStyle(fontSize: 12),
-                    ),
-                    Text(
-                      'Total length: $dataLength chars$tailInfo',
-                      style: TextStyle(fontSize: 12),
-                    ),
-                    if (isHex && fillHexWithZeros && _writeHex.text.isEmpty)
-                      Text(
-                        'Using: Auto-filled zeros (00)',
-                        style: TextStyle(fontSize: 12, color: Colors.blue, fontWeight: FontWeight.bold),
+                    Icon(Icons.nfc, color: Colors.white, size: 24),
+                    SizedBox(width: 10),
+                    Expanded(
+                      child: Text(
+                        'Approach Card to Write',
+                        style: TextStyle(
+                          fontSize: 18,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.white,
+                        ),
                       ),
-                    if (!isHex && _writeText.text.isNotEmpty)
-                      Text(
-                        'Input: ${_writeText.text.length} chars',
-                        style: TextStyle(fontSize: 12, color: Colors.green),
-                      ),
-                    SizedBox(height: 5),
-                    Text(
-                      'Preview:',
-                      style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12),
-                    ),
-                    Text(
-                      dataPreview,
-                      style: TextStyle(fontSize: 12, fontFamily: 'monospace'),
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
                     ),
                   ],
                 ),
-              ),
-            ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: () {
-                Navigator.of(context).pop();
-                setState(() {
-                  showWritePrompt = false;
-                  isWriting = false;
-                  isReading = true;
-                  pendingWriteData = '';
-                  fillHexWithZeros = false;
-                  status = 'Cancelled';
-                });
-              },
-              child: Text('CANCEL'),
+                SizedBox(height: 8),
+                Text(
+                  'Bring the RFID card close to your phone',
+                  style: TextStyle(color: Colors.white70),
+                ),
+                SizedBox(height: 8),
+                if (_writingProgress.isNotEmpty)
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      SizedBox(height: 4),
+                      Text(
+                        _writingProgress,
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: Colors.white,
+                          fontFamily: 'monospace',
+                        ),
+                      ),
+                    ],
+                  ),
+                SizedBox(height: 8),
+                LinearProgressIndicator(
+                  backgroundColor: Colors.orange[200],
+                  valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                ),
+              ],
             ),
-            ElevatedButton(
-              onPressed: () {
-                Navigator.of(context).pop();
-                _executeWrite();
-              },
-              style: ElevatedButton.styleFrom(
-                backgroundColor: Colors.orange,
-              ),
-              child: Text('CONTINUE'),
+          ),
+        ),
+      ),
+    );
+
+    Overlay.of(context).insert(_writingNotificationOverlay!);
+  }
+
+  // Update writing progress
+  void _updateWritingProgress(String progress) {
+    if (_writingNotificationOverlay != null) {
+      setState(() {
+        _writingProgress = progress;
+      });
+      _writingNotificationOverlay!.markNeedsBuild();
+    }
+  }
+
+  // Hide writing notification
+  void _hideWritingNotification() {
+    if (_writingNotificationOverlay != null) {
+      _writingNotificationOverlay!.remove();
+      _writingNotificationOverlay = null;
+    }
+    _writingProgress = '';
+  }
+
+  Future<void> _writeToCard({required bool isHex}) async {
+    if (_isWriting) return;
+
+    _isWriting = true;
+    _updateStatus('Preparing write...');
+
+    // Show notification
+    _showWritingNotification(isHex: isHex);
+
+    try {
+      await _stopNFC();
+
+      String data;
+      if (isHex) {
+        data = await _prepareHexData();
+      } else {
+        data = await _prepareTextData();
+      }
+
+      if (data.isEmpty) {
+        _showSnackBar('No data to write');
+        _hideWritingNotification();
+        _isWriting = false;
+        return;
+      }
+
+      _updateStatus('Writing to card...');
+      _updateWritingProgress('Starting write...');
+
+      // Add a small delay to show the notification
+      await Future.delayed(Duration(milliseconds: 500));
+
+      final result = await methodCh.invokeMethod('writeData', {
+        'data': data,
+        'isHex': isHex,
+      });
+
+      if (result == true) {
+        _updateStatus('Write successful!');
+        _updateWritingProgress('✓ Write completed!');
+
+        // Delay before hiding notification to show success
+        await Future.delayed(Duration(seconds: 1));
+
+        _hideWritingNotification();
+        _showSuccessDialog();
+      } else {
+        _updateStatus('Write failed');
+        _updateWritingProgress('✗ Write failed');
+
+        // Delay before hiding notification to show error
+        await Future.delayed(Duration(seconds: 1));
+
+        _hideWritingNotification();
+        _showSnackBar('Write failed. Please try again.');
+      }
+    } catch (e) {
+      _updateStatus('Write error: $e');
+      _updateWritingProgress('✗ Error: $e');
+
+      // Delay before hiding notification to show error
+      await Future.delayed(Duration(seconds: 1));
+
+      _hideWritingNotification();
+      _showSnackBar('Write error: $e');
+    } finally {
+      _isWriting = false;
+      _clearWriteFields();
+
+      // Restart NFC after a delay
+      Future.delayed(Duration(seconds: 2), () {
+        if (_isAppActive && !_isWriting) {
+          _initializeNFC();
+        }
+      });
+    }
+  }
+
+  Future<String> _prepareHexData() async {
+    String hex = _writeHexController.text.trim().replaceAll(RegExp(r'\s'), '').toUpperCase();
+
+    if (hex.isNotEmpty && !RegExp(r'^[0-9A-F]+$').hasMatch(hex)) {
+      throw 'Invalid hex characters';
+    }
+
+    if (hex.isNotEmpty && hex.length % 2 != 0) {
+      throw 'Hex must have even number of characters';
+    }
+
+    if (hex.isEmpty && _fillHexWithZeros) {
+      hex = '00' * 768;
+      _updateWritingProgress('Using zeros (00) for all blocks');
+    } else if (hex.isNotEmpty) {
+      const maxHexChars = 1536;
+      if (hex.length >= maxHexChars) {
+        hex = hex.substring(0, maxHexChars);
+        _updateWritingProgress('Hex truncated to $maxHexChars chars');
+      } else {
+        final zerosNeeded = maxHexChars - hex.length;
+        final evenZerosNeeded = zerosNeeded % 2 == 0 ? zerosNeeded : zerosNeeded - 1;
+        hex = hex + ('00' * (evenZerosNeeded ~/ 2));
+        _updateWritingProgress('Added ${evenZerosNeeded ~/ 2} zero pairs');
+      }
+    }
+
+    return hex;
+  }
+
+  Future<String> _prepareTextData() async {
+    String text = _writeTextController.text.trim();
+
+    if (text.isEmpty) {
+      throw 'Please enter text to write';
+    }
+
+    const maxLength = 768;
+    if (text.length >= maxLength) {
+      text = text.substring(0, maxLength);
+      _updateWritingProgress('Text truncated to $maxLength chars');
+    } else {
+      final dotsNeeded = maxLength - text.length;
+      text = text + ('.' * dotsNeeded);
+      _updateWritingProgress('Added $dotsNeeded tail dots');
+    }
+
+    return text;
+  }
+
+  void _clearWriteFields() {
+    _writeTextController.clear();
+    _writeHexController.clear();
+    if (mounted) {
+      setState(() => _fillHexWithZeros = false);
+    }
+  }
+
+  void _updateStatus(String status) {
+    if (mounted) {
+      setState(() => _status = status);
+    }
+  }
+
+  void _showSnackBar(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        duration: Duration(seconds: 3),
+        backgroundColor: message.contains('error') || message.contains('failed')
+            ? Colors.red
+            : null,
+      ),
+    );
+  }
+
+  void _showSuccessDialog() {
+    showDialog(
+      context: context,
+      barrierDismissible: true,
+      builder: (context) => AlertDialog(
+        title: Row(
+          children: [
+            Icon(Icons.check_circle, color: Colors.green),
+            SizedBox(width: 10),
+            Text('Success'),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.check_circle_outline, size: 60, color: Colors.green),
+            SizedBox(height: 16),
+            Text(
+              'Data written successfully!',
+              textAlign: TextAlign.center,
+              style: TextStyle(fontSize: 16),
+            ),
+            SizedBox(height: 8),
+            Text(
+              'Card is ready for use.',
+              textAlign: TextAlign.center,
+              style: TextStyle(fontSize: 14, color: Colors.grey),
             ),
           ],
-        );
-      },
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: Text('OK'),
+          ),
+        ],
+      ),
     );
   }
 
   @override
   void dispose() {
-    print('Disposing...');
     WidgetsBinding.instance.removeObserver(this);
-    _sub?.cancel();
-    _writeText.dispose();
-    _writeHex.dispose();
+    _nfcSubscription?.cancel();
+    _writeTextController.dispose();
+    _writeHexController.dispose();
+    // Ensure notification is removed
+    _hideWritingNotification();
     super.dispose();
   }
 
@@ -668,510 +503,40 @@ class _RFIDPageState extends State<RFIDPage> with WidgetsBindingObserver {
         actions: [
           IconButton(
             icon: Icon(Icons.refresh),
-            onPressed: isWriting ? null : _startScan,
-            tooltip: 'Scan',
+            onPressed: _isWriting ? null : () {
+              _updateStatus('Restarting...');
+              _initializeNFC();
+            },
           ),
         ],
       ),
-      body: SingleChildScrollView(
-        padding: EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            // Status and UID
-            Container(
-              padding: EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: isWriting ? Colors.orange[50] : Colors.blue[50],
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(
-                  color: isWriting ? Colors.orange : Colors.blue,
-                  width: isWriting ? 2 : 1,
-                ),
-              ),
-              child: Row(
-                children: [
-                  Icon(
-                    isWriting ? Icons.edit : Icons.nfc,
-                    color: isWriting ? Colors.orange : Colors.blue,
-                  ),
-                  SizedBox(width: 12),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          status.isEmpty ? 'Ready - tap RFID card' : status,
-                          style: TextStyle(
-                            fontWeight: FontWeight.w500,
-                            color: isWriting ? Colors.orange : Colors.black,
-                          ),
-                        ),
-                        SizedBox(height: 4),
-                        Text(
-                          'UID: ${uid.isEmpty ? '-' : uid}',
-                          style: TextStyle(
-                            fontFamily: 'monospace',
-                            fontSize: 12,
-                            color: Colors.grey[700],
-                          ),
-                        ),
-                        if (isWriting && pendingWriteData.isNotEmpty) ...[
-                          SizedBox(height: 4),
-                          Text(
-                            'Writing: ${pendingWriteData.length} ${pendingWriteIsHex ? 'hex chars' : 'chars'}',
-                            style: TextStyle(
-                              fontSize: 12,
-                              color: Colors.orange,
-                            ),
-                          ),
-                        ],
-                      ],
-                    ),
-                  ),
-                  if (isWriting)
-                    SizedBox(
-                      width: 20,
-                      height: 20,
-                      child: CircularProgressIndicator(
-                        strokeWidth: 2,
-                        valueColor: AlwaysStoppedAnimation<Color>(Colors.orange),
-                      ),
-                    ),
-                ],
-              ),
-            ),
+      body: _buildBody(),
+    );
+  }
 
-            SizedBox(height: 24),
+  Widget _buildBody() {
+    return SingleChildScrollView(
+      padding: EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Status Card
+          _buildStatusCard(),
+          SizedBox(height: 20),
 
-            // Text Data Display
-            _dataDisplay('TEXT DATA', textData, Colors.green),
+          // Data Display
+          _buildDataSection(),
+          SizedBox(height: 20),
 
-            SizedBox(height: 20),
-
-            // Hex Data Display
-            _dataDisplay('HEX DATA', hexData, Colors.blue),
-
-            SizedBox(height: 30),
-
-            Divider(),
-
-            // Write Section
-            Text(
-              'Write Data to Card',
-              style: TextStyle(
-                fontWeight: FontWeight.bold,
-                fontSize: 18,
-                color: Colors.purple,
-              ),
-            ),
-            SizedBox(height: 16),
-
-            // Write Text (ALWAYS adds tail dots)
-            Card(
-              elevation: 2,
-              child: Padding(
-                padding: EdgeInsets.all(16),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        Text(
-                          'Write as Text',
-                          style: TextStyle(fontWeight: FontWeight.bold),
-                        ),
-                        Container(
-                          padding: EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                          decoration: BoxDecoration(
-                            color: Colors.green[50],
-                            borderRadius: BorderRadius.circular(4),
-                            border: Border.all(color: Colors.green),
-                          ),
-                          child: Text(
-                            'Writes to ALL blocks',
-                            style: TextStyle(
-                              fontSize: 10,
-                              fontWeight: FontWeight.bold,
-                              color: Colors.green,
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                    SizedBox(height: 8),
-                    Text(
-                      'Will write to all writable blocks (max 768 chars total)',
-                      style: TextStyle(fontSize: 12, color: Colors.grey),
-                    ),
-
-                    SizedBox(height: 10),
-                    Container(
-                      padding: EdgeInsets.all(12),
-                      decoration: BoxDecoration(
-                        color: Colors.yellow[50],
-                        borderRadius: BorderRadius.circular(8),
-                        border: Border.all(color: Colors.yellow),
-                      ),
-                      child: Row(
-                        children: [
-                          Icon(Icons.info, color: Colors.orange, size: 20),
-                          SizedBox(width: 8),
-                          Expanded(
-                            child: Text(
-                              'Automatically adds tail dots to fill 768 characters',
-                              style: TextStyle(fontSize: 12, color: Colors.orange[800]),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-
-                    SizedBox(height: 10),
-                    TextField(
-                      controller: _writeText,
-                      decoration: InputDecoration(
-                        labelText: 'Enter text to write',
-                        border: OutlineInputBorder(),
-                        hintText: 'Your text + auto dots to fill card',
-                        suffixIcon: IconButton(
-                          icon: Icon(Icons.clear),
-                          onPressed: () {
-                            _writeText.clear();
-                            setState(() {});
-                          },
-                        ),
-                      ),
-                      maxLines: 3,
-                      enabled: !isWriting,
-                      onChanged: (value) {
-                        // Show character count
-                        setState(() {});
-                      },
-                    ),
-                    SizedBox(height: 8),
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              'Input: ${_writeText.text.length} chars',
-                              style: TextStyle(
-                                fontSize: 12,
-                                color: Colors.green,
-                              ),
-                            ),
-                            if (_writeText.text.isNotEmpty)
-                              Text(
-                                'Tail dots: ${768 - min(_writeText.text.length, 768)}',
-                                style: TextStyle(
-                                  fontSize: 12,
-                                  color: Colors.blue,
-                                ),
-                              ),
-                          ],
-                        ),
-                        Text(
-                          'Total: ${min(_writeText.text.length, 768)}/${min(_writeText.text.length + max(0, 768 - _writeText.text.length), 768)}',
-                          style: TextStyle(
-                            fontSize: 12,
-                            color: _writeText.text.length > 768 ? Colors.red : Colors.grey,
-                          ),
-                        ),
-                      ],
-                    ),
-                    SizedBox(height: 10),
-                    ElevatedButton(
-                      onPressed: isWriting ? null : () => _initiateWrite(isHex: false),
-                      style: ElevatedButton.styleFrom(
-                        minimumSize: Size(double.infinity, 50),
-                        backgroundColor: isWriting ? Colors.grey : Colors.green,
-                      ),
-                      child: isWriting
-                          ? Row(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          SizedBox(
-                            width: 20,
-                            height: 20,
-                            child: CircularProgressIndicator(
-                              strokeWidth: 2,
-                              valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
-                            ),
-                          ),
-                          SizedBox(width: 10),
-                          Text('WAITING...'),
-                        ],
-                      )
-                          : Row(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          Icon(Icons.edit),
-                          SizedBox(width: 8),
-                          Text('WRITE TEXT + TAIL DOTS'),
-                        ],
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-
-            SizedBox(height: 20),
-
-            // Write Hex with "Fill with zeros if empty" option
-            Card(
-              elevation: 2,
-              child: Padding(
-                padding: EdgeInsets.all(16),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        Text(
-                          'Write as Hex',
-                          style: TextStyle(fontWeight: FontWeight.bold),
-                        ),
-                        Container(
-                          padding: EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                          decoration: BoxDecoration(
-                            color: Colors.blue[50],
-                            borderRadius: BorderRadius.circular(4),
-                            border: Border.all(color: Colors.blue),
-                          ),
-                          child: Text(
-                            'Writes to ALL blocks',
-                            style: TextStyle(
-                              fontSize: 10,
-                              fontWeight: FontWeight.bold,
-                              color: Colors.blue,
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                    SizedBox(height: 8),
-                    Text(
-                      'Will write to all writable blocks (max 1536 hex chars = 768 bytes)',
-                      style: TextStyle(fontSize: 12, color: Colors.grey),
-                    ),
-
-                    // Fill hex with zeros checkbox
-                    SizedBox(height: 10),
-                    Row(
-                      children: [
-                        Checkbox(
-                          value: fillHexWithZeros,
-                          onChanged: isWriting ? null : (value) {
-                            setState(() {
-                              fillHexWithZeros = value ?? false;
-                            });
-                          },
-                          activeColor: Colors.blue,
-                        ),
-                        SizedBox(width: 8),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                'Fill with zeros (00) if empty',
-                                style: TextStyle(fontWeight: FontWeight.w500),
-                              ),
-                              Text(
-                                'If hex field is empty, fills card with 0x00',
-                                style: TextStyle(fontSize: 11, color: Colors.grey),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ],
-                    ),
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              'Input: ${_writeHex.text.replaceAll(RegExp(r'\s'), '').length} hex chars',
-                              style: TextStyle(
-                                fontSize: 12,
-                                color: Colors.blue,
-                              ),
-                            ),
-                            if (_writeHex.text.isNotEmpty)
-                              Text(
-                                'Tail zeros: ${1536 - min(_writeHex.text.replaceAll(RegExp(r'\s'), '').length, 1536)}',
-                                style: TextStyle(
-                                  fontSize: 12,
-                                  color: Colors.purple,
-                                ),
-                              ),
-                          ],
-                        ),
-                        Text(
-                          'Total: ${min(_writeHex.text.replaceAll(RegExp(r'\s'), '').length, 1536)}/${min(_writeHex.text.replaceAll(RegExp(r'\s'), '').length + max(0, 1536 - _writeHex.text.replaceAll(RegExp(r'\s'), '').length), 1536)}',
-                          style: TextStyle(
-                            fontSize: 12,
-                            color: _writeHex.text.replaceAll(RegExp(r'\s'), '').length > 1536 ? Colors.red : Colors.grey,
-                          ),
-                        ),
-                      ],
-                    ),
-// Add this Container after the checkbox Row in hex section
-                    Container(
-                      padding: EdgeInsets.all(12),
-                      decoration: BoxDecoration(
-                        color: Colors.blue[50],
-                        borderRadius: BorderRadius.circular(8),
-                        border: Border.all(color: Colors.blue),
-                      ),
-                      child: Row(
-                        children: [
-                          Icon(Icons.info, color: Colors.blue, size: 20),
-                          SizedBox(width: 8),
-                          Expanded(
-                            child: Text(
-                              'Automatically adds tail zeros (00) to fill 1536 hex chars',
-                              style: TextStyle(fontSize: 12, color: Colors.blue[800]),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                    SizedBox(height: 10),
-                    SizedBox(height: 10),
-                    TextField(
-                      controller: _writeHex,
-                      decoration: InputDecoration(
-                        labelText: 'Enter hex data (no spaces)',
-                        border: OutlineInputBorder(),
-                        hintText: fillHexWithZeros ? 'Leave empty for zeros (00)' : 'Type hex or leave empty and check above',
-                        suffixIcon: IconButton(
-                          icon: Icon(Icons.clear),
-                          onPressed: () => _writeHex.clear(),
-                        ),
-                      ),
-                      enabled: !isWriting,
-                      onChanged: (value) {
-                        // If user starts typing and checkbox is checked, uncheck it
-                        if (fillHexWithZeros && value.isNotEmpty) {
-                          setState(() {
-                            fillHexWithZeros = false;
-                          });
-                        }
-                        setState(() {});
-                      },
-                    ),
-                    SizedBox(height: 8),
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        Text(
-                          'Hex characters: ${_writeHex.text.replaceAll(RegExp(r'\s'), '').length}/1536',
-                          style: TextStyle(
-                            fontSize: 12,
-                            color: _writeHex.text.replaceAll(RegExp(r'\s'), '').length > 1536 ? Colors.red : Colors.grey,
-                          ),
-                        ),
-                        if (_writeHex.text.replaceAll(RegExp(r'\s'), '').length > 1536)
-                          Text(
-                            'Will be truncated',
-                            style: TextStyle(
-                              fontSize: 12,
-                              color: Colors.red,
-                            ),
-                          ),
-                      ],
-                    ),
-                    SizedBox(height: 10),
-                    ElevatedButton(
-                      onPressed: isWriting ? null : () => _initiateWrite(isHex: true),
-                      style: ElevatedButton.styleFrom(
-                        minimumSize: Size(double.infinity, 50),
-                        backgroundColor: isWriting ? Colors.grey : Colors.blue,
-                      ),
-                      child: isWriting
-                          ? Row(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          SizedBox(
-                            width: 20,
-                            height: 20,
-                            child: CircularProgressIndicator(
-                              strokeWidth: 2,
-                              valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
-                            ),
-                          ),
-                          SizedBox(width: 10),
-                          Text('WAITING...'),
-                        ],
-                      )
-                          : Row(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          Icon(Icons.code),
-                          SizedBox(width: 8),
-                          Text(fillHexWithZeros && _writeHex.text.isEmpty
-                              ? 'WRITE ZEROS (ALL BLOCKS)'
-                              : 'WRITE HEX + TAIL ZEROS'),
-                        ],
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-
-            SizedBox(height: 20),
-
-            // Info Section
-            Container(
-              padding: EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: Colors.grey[50],
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(color: Colors.grey),
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    '📝 Write Summary:',
-                    style: TextStyle(fontWeight: FontWeight.bold),
-                  ),
-                  SizedBox(height: 8),
-                  Text('• Text writing: Your text + tail dots = 768 total chars'),
-                  Text('• Hex writing: Your hex + tail zeros = 1536 total hex chars'),
-                  Text('• Example hex: "2E2E" (2 bytes) + 1532 zeros = 1536 total'),
-                  Text('• Hex field empty + "Fill with zeros" = writes full card zeros'),
-                  SizedBox(height: 8),
-                  Text(
-                    'Card Capacity:',
-                    style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12),
-                  ),
-                  Text('• Always 768 total characters for text'),
-                  Text('• 1536 hex characters max (768 bytes)'),
-                  Text('• Tail dots ensure full card utilization'),
-                ],
-              ),
-            ),
-          ],
-        ),
+          // Write Section
+          _buildWriteSection(),
+        ],
       ),
     );
   }
 
-  Widget _dataDisplay(String title, String data, Color color) {
+  Widget _buildStatusCard() {
     return Card(
-      elevation: 2,
-      color: color.withOpacity(0.1),
       child: Padding(
         padding: EdgeInsets.all(16),
         child: Column(
@@ -1179,44 +544,219 @@ class _RFIDPageState extends State<RFIDPage> with WidgetsBindingObserver {
           children: [
             Row(
               children: [
-                Text(
-                  title,
-                  style: TextStyle(
-                    fontWeight: FontWeight.bold,
-                    fontSize: 16,
-                    color: color,
+                Icon(
+                  _isWriting ? Icons.edit : Icons.nfc,
+                  color: _isWriting ? Colors.orange : Colors.blue,
+                ),
+                SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        _status,
+                        style: TextStyle(
+                          fontWeight: FontWeight.w500,
+                          color: _isWriting ? Colors.orange : Colors.black,
+                        ),
+                      ),
+                      SizedBox(height: 4),
+                      Text(
+                        'UID: ${_uid.isEmpty ? '-' : _uid}',
+                        style: TextStyle(
+                          fontFamily: 'monospace',
+                          fontSize: 12,
+                          color: Colors.grey[700],
+                        ),
+                      ),
+                    ],
                   ),
                 ),
-                SizedBox(width: 10),
-                Text(
-                  '(${data.length} chars)',
-                  style: TextStyle(fontSize: 12, color: Colors.grey),
-                ),
+                if (_isWriting)
+                  SizedBox(
+                    width: 20,
+                    height: 20,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
               ],
-            ),
-            SizedBox(height: 10),
-            Container(
-              width: double.infinity,
-              padding: EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: Colors.white,
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(color: color.withOpacity(0.3)),
-              ),
-              constraints: BoxConstraints(minHeight: 100, maxHeight: 200),
-              child: SingleChildScrollView(
-                child: SelectableText(
-                  data,
-                  style: TextStyle(
-                    fontFamily: 'monospace',
-                    fontSize: 14,
-                  ),
-                ),
-              ),
             ),
           ],
         ),
       ),
+    );
+  }
+
+  Widget _buildDataSection() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text('Tag Data', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+        SizedBox(height: 10),
+
+        Card(
+          child: Padding(
+            padding: EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('Text Data', style: TextStyle(fontWeight: FontWeight.bold)),
+                SizedBox(height: 8),
+                Container(
+                  width: double.infinity,
+                  padding: EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: Colors.grey[50],
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  constraints: BoxConstraints(minHeight: 60, maxHeight: 150),
+                  child: SingleChildScrollView(
+                    child: SelectableText(
+                      _textData,
+                      style: TextStyle(fontFamily: 'monospace'),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+
+        SizedBox(height: 10),
+
+        Card(
+          child: Padding(
+            padding: EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('Hex Data', style: TextStyle(fontWeight: FontWeight.bold)),
+                SizedBox(height: 8),
+                Container(
+                  width: double.infinity,
+                  padding: EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: Colors.grey[50],
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  constraints: BoxConstraints(minHeight: 60, maxHeight: 150),
+                  child: SingleChildScrollView(
+                    child: SelectableText(
+                      _hexData,
+                      style: TextStyle(fontFamily: 'monospace'),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildWriteSection() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text('Write to Card', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+        SizedBox(height: 10),
+
+        // Text Write
+        Card(
+          child: Padding(
+            padding: EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('Write Text', style: TextStyle(fontWeight: FontWeight.bold)),
+                SizedBox(height: 8),
+                TextField(
+                  controller: _writeTextController,
+                  decoration: InputDecoration(
+                    labelText: 'Enter text',
+                    border: OutlineInputBorder(),
+                    hintText: 'Text + auto dots to fill 768 chars',
+                  ),
+                  maxLines: 2,
+                  enabled: !_isWriting,
+                ),
+                SizedBox(height: 10),
+                SizedBox(
+                  width: double.infinity,
+                  height: 45,
+                  child: ElevatedButton(
+                    onPressed: _isWriting ? null : () => _writeToCard(isHex: false),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.green,
+                    ),
+                    child: _isWriting
+                        ? CircularProgressIndicator(
+                      valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                      strokeWidth: 2,
+                    )
+                        : Text('WRITE TEXT'),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+
+        SizedBox(height: 10),
+
+        // Hex Write
+        Card(
+          child: Padding(
+            padding: EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('Write Hex', style: TextStyle(fontWeight: FontWeight.bold)),
+                SizedBox(height: 8),
+                Row(
+                  children: [
+                    Checkbox(
+                      value: _fillHexWithZeros,
+                      onChanged: _isWriting ? null : (value) {
+                        setState(() => _fillHexWithZeros = value ?? false);
+                      },
+                    ),
+                    Expanded(
+                      child: Text('Fill with zeros if empty'),
+                    ),
+                  ],
+                ),
+                TextField(
+                  controller: _writeHexController,
+                  decoration: InputDecoration(
+                    labelText: 'Enter hex (no spaces)',
+                    border: OutlineInputBorder(),
+                    hintText: _fillHexWithZeros ? 'Leave empty for zeros' : 'Enter hex data',
+                  ),
+                  enabled: !_isWriting,
+                ),
+                SizedBox(height: 10),
+                SizedBox(
+                  width: double.infinity,
+                  height: 45,
+                  child: ElevatedButton(
+                    onPressed: _isWriting ? null : () => _writeToCard(isHex: true),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.blue,
+                    ),
+                    child: _isWriting
+                        ? CircularProgressIndicator(
+                      valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                      strokeWidth: 2,
+                    )
+                        : Text('WRITE HEX'),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ],
     );
   }
 }

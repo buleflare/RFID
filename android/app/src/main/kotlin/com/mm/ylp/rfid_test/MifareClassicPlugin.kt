@@ -583,11 +583,9 @@ object MifareClassicPlugin {
         if (totalBytesWritten == 0) {
             throw Exception("Could not write any data. Card may be locked or authentication failed.")
         }
-
         if (totalBytesWritten < dataToWrite.size) {
             println("DEBUG: Warning: Only wrote $totalBytesWritten of ${dataToWrite.size} bytes")
         }
-
         // Read the card again to show updated data
         currentTag?.let {
             println("DEBUG: Re-reading card to verify write...")
